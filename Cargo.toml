@@ -1,0 +1,23 @@
+[package]
+name = "pluey"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.103"
+bytemuck = { version = "1.25.1", features = ["derive"] }
+image = "0.25.10"
+pollster = "1.0.1"
+wgpu = "30.0.0"
+winit = "0.30.13"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+complexity = "warn"
+correctness = "deny"
+pedantic = "warn"
+perf = "warn"
+style = "warn"
+suspicious = "deny"
