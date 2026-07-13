@@ -1,6 +1,8 @@
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 use std::sync::Arc;
 
 use anyhow::Result;
+use wgpu::PipelineCompilationOptions;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, event_loop::OwnedDisplayHandle, window::Window};
 
@@ -90,24 +92,30 @@ pub struct Renderer {
     size: PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
-    diffuse_bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
-    img_width: u32,
-    img_height: u32,
     max_texture_dim: u32,
     base_scale: [f32; 2],
     zoom: f32,
     offset: [f32; 2],
     dragging: bool,
     last_cursor: Option<(f64, f64)>,
+    texture_bind_group_layout: wgpu::BindGroupLayout,
+    image: Option<LoadedImage>,
+}
+
+struct LoadedImage {
+    bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
 }
 
 impl Renderer {
+    #[allow(clippy::too_many_lines)]
     pub async fn new(
         _display: OwnedDisplayHandle,
         window: Arc<Window>,
-        image_path: &str,
+        image_path: Option<&str>,
     ) -> Result<Self> {
         let size = window.inner_size();
 
@@ -147,53 +155,6 @@ impl Renderer {
         surface.configure(&device, &config);
 
         // --- Load image and upload to a texture ---
-        let img = image::open(image_path)?.to_rgba8();
-        let (img_width, img_height) = img.dimensions();
-
-        let texture_size = wgpu::Extent3d {
-            width: img_width,
-            height: img_height,
-            depth_or_array_layers: 1,
-        };
-
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Image Texture"),
-            size: texture_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &img,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * img_width),
-                rows_per_image: Some(img_height),
-            },
-            texture_size,
-        );
-
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        });
-
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Texture Bind Group Layout"),
@@ -217,23 +178,23 @@ impl Renderer {
                 ],
             });
 
-        let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Diffuse Bind Group"),
-            layout: &texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+        let image = match image_path {
+            Some(path) => Some(Self::load_image_texture(
+                &device,
+                &queue,
+                &texture_bind_group_layout,
+                path,
+            )?),
+            None => None,
+        };
 
         // --- Uniform buffer holding the aspect-fit scale ---
-        let base_scale = native_scale(clamped_width, clamped_height, img_width, img_height);
+        let base_scale = native_scale(
+            clamped_width,
+            clamped_height,
+            image.as_ref().map_or(0, |img| img.width),
+            image.as_ref().map_or(0, |img| img.height),
+        );
         let zoom = 1.0;
         let offset = [0.0, 0.0];
         let uniforms = Uniforms {
@@ -300,7 +261,7 @@ impl Renderer {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 buffers: &[Some(Vertex::desc())],
-                compilation_options: Default::default(),
+                compilation_options: PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -310,7 +271,7 @@ impl Renderer {
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
-                compilation_options: Default::default(),
+                compilation_options: PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -329,18 +290,126 @@ impl Renderer {
             size: PhysicalSize::new(clamped_width, clamped_height),
             render_pipeline,
             vertex_buffer,
-            diffuse_bind_group,
             uniform_buffer,
             uniform_bind_group,
-            img_width,
-            img_height,
             max_texture_dim,
             base_scale,
             zoom,
             offset,
             dragging: false,
             last_cursor: None,
+            texture_bind_group_layout,
+            image,
         })
+    }
+
+    pub fn apply_loaded_image(&mut self, data: &crate::LoadedImageData) {
+        self.image = Some(Self::upload_rgba_to_texture(
+            &self.device,
+            &self.queue,
+            &self.texture_bind_group_layout,
+            &data.rgba,
+            data.width,
+            data.height,
+        ));
+
+        self.base_scale = native_scale(self.size.width, self.size.height, data.width, data.height);
+        self.zoom = 1.0;
+        self.offset = [0.0, 0.0];
+        self.update_uniforms();
+    }
+
+    fn upload_rgba_to_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> LoadedImage {
+        let texture_size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Image Texture"),
+            size: texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            texture_size,
+        );
+
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Diffuse Bind Group"),
+            layout: bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        LoadedImage {
+            bind_group,
+            width,
+            height,
+        }
+    }
+
+    fn load_image_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        image_path: &str,
+    ) -> Result<LoadedImage> {
+        let img = image::open(image_path)?.to_rgba8();
+        let (width, height) = img.dimensions();
+
+        Ok(Self::upload_rgba_to_texture(
+            device,
+            queue,
+            bind_group_layout,
+            &img,
+            width,
+            height,
+        ))
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -356,13 +425,10 @@ impl Renderer {
         self.config.height = clamped_height;
         self.surface.configure(&self.device, &self.config);
 
-        // recompute letterbox scale for the new window shape
-        self.base_scale = native_scale(
-            clamped_width,
-            clamped_height,
-            self.img_width,
-            self.img_height,
-        );
+        if let Some(image) = &self.image {
+            self.base_scale =
+                native_scale(clamped_width, clamped_height, image.width, image.height);
+        }
         self.update_uniforms();
     }
 
@@ -379,12 +445,11 @@ impl Renderer {
     }
 
     fn cursor_to_ndc(&self, pos: (f64, f64)) -> [f32; 2] {
-        let x = (pos.0 / self.size.width as f64) * 2.0 - 1.0;
-        let y = 1.0 - (pos.1 / self.size.height as f64) * 2.0;
+        let x = (pos.0 / f64::from(self.size.width)) * 2.0 - 1.0;
+        let y = 1.0 - (pos.1 / f64::from(self.size.height)) * 2.0;
         [x as f32, y as f32]
     }
 
-    /// Zoom in/out, keeping the point under the cursor fixed on screen.
     pub fn zoom(&mut self, scroll_delta: f32, cursor_pos: (f64, f64)) {
         let old_zoom = self.zoom;
         let factor = 1.0 + scroll_delta * 0.1;
@@ -414,15 +479,14 @@ impl Renderer {
         self.last_cursor = None;
     }
 
-    /// Returns true if the frame needs a redraw.
     pub fn cursor_moved(&mut self, pos: (f64, f64)) -> bool {
         if !self.dragging {
             self.last_cursor = Some(pos);
             return false;
         }
         let last = self.last_cursor.unwrap_or(pos);
-        let dx = (pos.0 - last.0) / self.size.width as f64 * 2.0;
-        let dy = -(pos.1 - last.1) / self.size.height as f64 * 2.0;
+        let dx = (pos.0 - last.0) / f64::from(self.size.width) * 2.0;
+        let dy = -(pos.1 - last.1) / f64::from(self.size.height) * 2.0;
         self.offset[0] += dx as f32;
         self.offset[1] += dy as f32;
         self.last_cursor = Some(pos);
@@ -488,11 +552,13 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.uniform_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.draw(0..6, 0..1);
+            if let Some(image) = &self.image {
+                render_pass.set_pipeline(&self.render_pipeline);
+                render_pass.set_bind_group(0, &image.bind_group, &[]);
+                render_pass.set_bind_group(1, &self.uniform_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                render_pass.draw(0..6, 0..1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
