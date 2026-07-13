@@ -42,6 +42,14 @@
             ];
 
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+            LD_LIBRARY_PATH =
+              with pkgs;
+              pkgs.lib.makeLibraryPath [
+                wayland
+                libxkbcommon
+                vulkan-loader
+                libGL
+              ];
           };
         }
       );

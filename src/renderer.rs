@@ -399,7 +399,11 @@ impl Renderer {
         bind_group_layout: &wgpu::BindGroupLayout,
         image_path: &str,
     ) -> Result<LoadedImage> {
-        let img = image::open(image_path)?.to_rgba8();
+        // Why is this not the default behaviour with image::open()
+        let img = image::ImageReader::open(image_path)?
+            .with_guessed_format()?
+            .decode()?
+            .to_rgba8();
         let (width, height) = img.dimensions();
 
         Ok(Self::upload_rgba_to_texture(
