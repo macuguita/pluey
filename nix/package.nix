@@ -9,6 +9,7 @@
   libGL,
   darwin,
   imagemagick,
+  libicns,
   copyDesktopItems,
   makeDesktopItem,
 }:
@@ -37,7 +38,9 @@ rustPlatform.buildRustPackage (finalAttrs: {
     makeWrapper
     copyDesktopItems
     imagemagick
-  ];
+  ] ++ lib.optionals stdenv.isDarwin [
+  libicns
+];
 
   buildInputs =
     lib.optionals stdenv.isLinux [
@@ -45,12 +48,6 @@ rustPlatform.buildRustPackage (finalAttrs: {
       libxkbcommon
       vulkan-loader
       libGL
-    ]
-    ++ lib.optionals stdenv.isDarwin [
-      darwin.apple_sdk.frameworks.Cocoa
-      darwin.apple_sdk.frameworks.QuartzCore
-      darwin.apple_sdk.frameworks.Metal
-      darwin.apple_sdk.frameworks.AppKit
     ];
 
   postFixup = lib.optionalString stdenv.isLinux ''
@@ -65,7 +62,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
       }
   '';
 
-  desktopItems = lib.singleton (makeDesktopItem {
+  desktopItems = lib.optionals stdenv.isLinux (lib.singleton (makeDesktopItem {
     name = "com.macuguita.Pluey";
     desktopName = "Pluey";
     exec = "pluey %F";
@@ -93,15 +90,32 @@ rustPlatform.buildRustPackage (finalAttrs: {
       "image/heic"
       "image/heif"
     ];
-  });
+  }));
 
-  postInstall = ''
+postInstall =
+  lib.optionalString stdenv.isLinux ''
     for size in 16 24 32 48 64 128 256; do
       geometry="$size"x"$size"
       mkdir -p "$out/share/icons/hicolor/$geometry/apps"
       magick package/pluey.png -resize "$geometry" \
         "$out/share/icons/hicolor/$geometry/apps/pluey.png"
     done
+  ''
+  + lib.optionalString stdenv.isDarwin ''
+    app="$out/Applications/Pluey.app"
+    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+
+    cp "$out/bin/${finalAttrs.pname}" "$app/Contents/MacOS/pluey"
+
+    substitute package/mac/Info.plist.in "$app/Contents/Info.plist" \
+      --subst-var-by version "${finalAttrs.version}"
+
+    iconDir="$TMPDIR/icons"
+    mkdir -p "$iconDir"
+    for size in 16 32 48 128 256 512; do
+      magick package/pluey.png -resize "''${size}x''${size}" "$iconDir/icon_$size.png"
+    done
+    png2icns "$app/Contents/Resources/AppIcon.icns" "$iconDir"/icon_*.png
   '';
 
   passthru = {
